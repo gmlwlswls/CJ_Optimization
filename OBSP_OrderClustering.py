@@ -194,11 +194,26 @@ class WarehouseSolver:
         
         kmeans = KMeans(n_clusters= n_clusters, random_state= 42)
         labels= kmeans.fit_predict(combined_dist)
+        
+        cluster_to_orders = defaultdict(list)
+        for ord_no, label in zip(order_sku_matrix.index, labels) :
+            cluster_to_orders[label].append(ord_no)
+        
+        all_orders= []
+        for cluster_orders in cluster_to_orders.values() :
+            all_orders.extend(cluster_orders)
                 
         order_to_cart = {}
-        for ord_no, cart_no in zip(order_sku_matrix.index, labels) :
-            cart_no += 1
-            order_to_cart[ord_no] = cart_no
+        cart_id = 1
+        for i in range(0, len(all_orders), cart_capa) :
+            batch = all_orders[i:i + cart_capa]
+            for ord_no in batch :
+                order_to_cart[ord_no] = cart_id
+            cart_id += 1
+
+        # for ord_no, cart_no in zip(order_sku_matrix.index, labels) :
+        #     cart_no += 1
+        #     order_to_cart[ord_no] = cart_no
  
         self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)
 
