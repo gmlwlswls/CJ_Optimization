@@ -12,7 +12,9 @@ from math import ceil
 
 # def main처럼 데이터프레임 타입으로 결과 리턴해주시면 됩니다. 데이터는 제공한 Sample_OutputData.csv와 동일한 형태로 리턴해주시면 됩니다.
 # SLAP - 고빈도 우선 + 주문 SKU 유사도 > 그리디 클러스터링으로 입출고 지점과 가까운 순으로 배정
-# OLBP - 주문별 SKU유사도 + 랙 위치 유사도 > KMeans 클러스터링으로 4개의 주문씩 클러스터링
+# OLBP - 주문별 SKU유사도 + 랙 위치 유사도 > KMeans 클러스터링으로 4개의 주문씩 클러스터링 
+# + 작업량 맞추는 작업
+# PRP - KNN
 
 @dataclass
 class WarehouseParameters:
@@ -217,34 +219,162 @@ class WarehouseSolver:
  
         self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)
 
-    def solve_picker_routing(self) -> None:
-        """Solve Pick Routing Problem (PRP) using simple sequencing"""
-        self.orders = self.orders.sort_values(['CART_NO', 'LOC'])
-        self.orders['SEQ'] = self.orders.groupby('CART_NO').cumcount() + 1
+    def assign_batches_combination_sum_strategy(self) -> None:
+        """
+        배치 단위로 피커-카트 배정을 수행한다.
+        Higest Workload cart를 기준으로 유사도가 먼 cart들의 조합을 만들어 anchor 작업량과 합이 같도록 더미를 구성한다.
+        """
+        assigned_carts = set()
+        batch_no = 1
+        n_pickers = self.params.number_pickers
+        carts_df = (
+            self.orders.groupby('CART_NO')
+            .agg(WORKLOAD=('SKU_CD', 'count'))
+            .reset_index()
+        )
+
+        while len(assigned_carts) < carts_df.shape[0]:
+            # 아직 배정되지 않은 cart 중 작업량이 가장 큰 cart 선택
+            unassigned = carts_df[~carts_df['CART_NO'].isin(assigned_carts)]
+            highest_workload_cart_row = unassigned.sort_values('WORKLOAD', ascending=False).iloc[0]
+            highest_workload_cartno = highest_workload_cart_row['CART_NO']
+            highest_workload_quantity = highest_workload_cart_row['WORKLOAD']
+
+            batch = []
+            pickers = {}
+
+            # anchor cart를 picker1에 할당
+            pickers[1] = [highest_workload_cartno]
+            batch.append(highest_workload_cartno)
+            assigned_carts.add(highest_workload_cartno)
+
+            # anchor와 유사도 계산
+            anchor_orders = self.orders[self.orders['CART_NO'] == highest_workload_cartno]
+            anchor_skus = anchor_orders['SKU_CD'].unique() # unique하는게 맞을듯! SKU_CD의 갯수 문제가 아니라 SKU_CD 종류로 인해 발생하는 작업량이 크게 늘어나는거라
+
+            cart_similarities = []
+            for _, row in unassigned.iterrows():
+                if row['CART_NO'] == highest_workload_cartno :
+                    continue
+                candidate_orders = self.orders[self.orders['CART_NO'] == row['CART_NO']]
+                candidate_skus = candidate_orders['SKU_CD'].unique()
+                intersection = len(set(anchor_skus) & set(candidate_skus))
+                union = len(set(anchor_skus) | set(candidate_skus))
+                jaccard_sim = intersection / union if union > 0 else 0
+                cart_similarities.append((row['CART_NO'], jaccard_sim, row['WORKLOAD']))
+
+            # 자카드 유사도를 기준으로 오름차순
+            # 작업량 기준으로 내림차순
+            # 유사도가 낮은 카트(피커별로 유사도가 낮게 배정해야까) + 유사도가 같다면 작업량이 높은 카트 순서
+            cart_similarities.sort(key=lambda x: (x[1], -x[2]))
+ 
+            # 작업량 가장 높은 카트 제외한 CART_NO, WORKLOAD만 가져오기
+            # [(59, 18), (76, 18), (82, 18), (112, 18), (3, 17), ,,]
+            remaining_carts = [(c[0], c[2]) for c in cart_similarities] 
+            used_carts = set()
+
+            # picker_id > 2,3,4
+            for picker_id in range(2, n_pickers + 1):
+                best_combo = None
+                best_diff = float('inf')
+
+                # 1~3개 조합 탐색
+                # 궁금증) 조합은 제한이 없어도 되지 않는지?
+                for r in range(1, min(4, len(remaining_carts) + 1)):
+                    # combo : (CART_NO, WORKLOAD, ) > 1개짜리 조합 ~ 3개짜리 조합
+                    for combo in combinations(remaining_carts, r):
+                        combo_carts = [c[0] for c in combo]
+                        combo_workload = sum(c[1] for c in combo)
+
+                        if any(c in used_carts for c in combo_carts):
+                            continue
+
+                        # 정해진 한 카트와 작업량 차이가 가장 작은 카트 합
+                        diff = abs(combo_workload - highest_workload_quantity)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_combo = combo_carts
+
+                        if diff == 0:
+                            break
+                    if best_diff == 0:
+                        break
+                
+                # best_cartno 조합
+                if best_combo:
+                    pickers[picker_id] = best_combo # {2 : 작업량 차이 제일 작은 조합}
+                    batch.extend(best_combo)
+                    used_carts.update(best_combo)
+                    assigned_carts.update(best_combo)
+
+            # 더미 기록
+            for picker, carts in pickers.items():
+                for cart in carts:
+                    self.orders.loc[self.orders['CART_NO'] == cart, 'PICKER_NO'] = picker
+                    self.orders.loc[self.orders['CART_NO'] == cart, 'BATCH_NO'] = batch_no
+                    # BATCH_NO : 카트들을 피커수에 맞게 묶은 배치 1(카트 N개가 피커 4명에게 배치되어 있음)
+
+            batch_no += 1
+
+    def solve_picker_routing_KNN(self) -> None:
+        """
+        PRP: 각 BATCH_NO → PICKER_NO → CART_NO 순으로,
+        CART 안의 SKU LOC를 OD_MATRIX를 활용해 가까운 순으로 방문하도록 SEQ 지정
+        """
+        seq_records = []
+
+        # 그룹 단위로 처리
+        for (batch_no, picker_no, cart_no), group in self.orders.groupby(['BATCH_NO', 'PICKER_NO', 'CART_NO']):
+            locs = group['LOC'].unique()
+            remaining_locs = set(locs)
+            route = []
+            current_loc = self.start_location
+
+            while remaining_locs:
+                next_loc = min(
+                    remaining_locs,
+                    key=lambda loc: self.od_matrix.loc[current_loc, loc]
+                )
+                route.append(next_loc)
+                remaining_locs.remove(next_loc)
+                current_loc = next_loc
+
+            # LOC 방문 순서를 기준으로 SKU 행에 SEQ를 매김
+            seq = 1
+            for loc in route:
+                loc_rows = group[group['LOC'] == loc]
+                for idx in loc_rows.index:
+                    seq_records.append((idx, seq))
+                    seq += 1
+
+        # SEQ를 orders에 반영
+        seq_df = pd.DataFrame(seq_records, columns=['index', 'SEQ']).set_index('index')
+        self.orders.loc[seq_df.index, 'SEQ'] = seq_df['SEQ']
+
 
     def solve(self) -> pd.DataFrame:
         """Execute complete warehouse optimization solution"""
         self.solve_storage_location()
         self.solve_order_batching()
-        self.solve_picker_routing()
-        if self.orders['LOC'].isna().any():
+        self.assign_batches_combination_sum_strategy()
+        self.solve_picker_routing_KNN()
+        '''if self.orders['LOC'].isna().any():
             raise ValueError("LOC에 할당되지 않은 SKU가 있습니다.")
         if self.orders['CART_NO'].isna().any():
             raise ValueError("CART_NO가 지정되지 않았습니다.")
         if self.orders['SEQ'].isna().any():
-            raise ValueError("SEQ가 지정되지 않았습니다.")
+            raise ValueError("SEQ가 지정되지 않았습니다.")'''
         return self.orders
 
 def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) -> pd.DataFrame:
     solver = WarehouseSolver(INPUT, PARAMETER, OD_MATRIX)
-    solver.solve().to_csv('./OLAP_CARTNO.csv', index= False)
     return solver.solve()
 
 if __name__ == "__main__":
     import time
-    test_INPUT = pd.read_csv("./data/Sample_InputData.csv")
-    test_PARAM = pd.read_csv("./data/Sample_Parameters.csv")
-    test_OD = pd.read_csv("./data/Sample_OD_Matrix.csv", index_col=0, header=0)
+    test_INPUT = pd.read_csv("sample_data/InputData.csv")
+    test_PARAM = pd.read_csv("sample_data/Parameters.csv")
+    test_OD = pd.read_csv("sample_data/OD_Matrix.csv", index_col=0, header=0)
     start_time = time.time()
     try:
         print("Data loaded successfully:")
