@@ -14,6 +14,7 @@ from math import ceil
 # SLAP - 고빈도 우선 + 주문 SKU 유사도 > 그리디 클러스터링으로 입출고 지점과 가까운 순으로 배정
 # OLBP - 주문별 SKU유사도 + 랙 위치 유사도 > KMeans 클러스터링으로 4개의 주문씩 클러스터링
 # + 작업량 맞추는 작업
+# PRP - 2_opt + Simulated Annealing
 
 
 @dataclass
@@ -222,10 +223,8 @@ class WarehouseSolver:
 
     def assign_batches_combination_sum_strategy(self) -> None:
         """
-        배치 단위로 피커-카트 배정을 수행한다.
-        Higest Workload cart를 기준으로 유사도가 먼 cart들의 조합을 만들어 anchor 작업량과 합이 같도록 더미를 구성한다.
+        (작업량 유사 & 카트 간 유사도 낮은)배치 단위로 피커-카트 배정
         """
-        from itertools import combinations
         assigned_carts = set()
         batch_no = 1
         n_pickers = self.params.number_pickers
@@ -238,34 +237,34 @@ class WarehouseSolver:
         while len(assigned_carts) < carts_df.shape[0]:
             # 아직 배정되지 않은 cart 중 작업량이 가장 큰 cart 선택
             unassigned = carts_df[~carts_df['CART_NO'].isin(assigned_carts)]
-            anchor_cart_row = unassigned.sort_values('WORKLOAD', ascending=False).iloc[0]
-            anchor_cart = anchor_cart_row['CART_NO']
-            anchor_workload = anchor_cart_row['WORKLOAD']
+            highest_workload_cart_row = unassigned.sort_values('WORKLOAD', ascending=False).iloc[0]
+            highest_workload_cartno = highest_workload_cart_row['CART_NO']
+            highest_workload_quantity = highest_workload_cart_row['WORKLOAD']
 
             batch = []
             pickers = {}
 
-            # anchor cart를 picker1에 할당
-            pickers[1] = [anchor_cart]
-            batch.append(anchor_cart)
-            assigned_carts.add(anchor_cart)
+            # highest_workload_cart를 picker1에 할당
+            pickers[1] = [highest_workload_cartno]
+            batch.append(highest_workload_cartno)
+            assigned_carts.add(highest_workload_cartno)
 
-            # anchor와 유사도 계산
-            anchor_orders = self.orders[self.orders['CART_NO'] == anchor_cart]
-            anchor_skus = anchor_orders['SKU_CD'].unique() #unique를 하는게 맞을지 고민!
+            # SKU 유사도 계산
+            highest_workload_orders = self.orders[self.orders['CART_NO'] == highest_workload_cartno]
+            highest_workload_skus = highest_workload_orders['SKU_CD'].unique()
 
             cart_similarities = []
             for _, row in unassigned.iterrows():
-                if row['CART_NO'] == anchor_cart:
+                if row['CART_NO'] == highest_workload_cartno:
                     continue
                 candidate_orders = self.orders[self.orders['CART_NO'] == row['CART_NO']]
                 candidate_skus = candidate_orders['SKU_CD'].unique()
-                intersection = len(set(anchor_skus) & set(candidate_skus))
-                union = len(set(anchor_skus) | set(candidate_skus))
+                intersection = len(set(highest_workload_skus) & set(candidate_skus))
+                union = len(set(highest_workload_skus) | set(candidate_skus))
                 jaccard_sim = intersection / union if union > 0 else 0
                 cart_similarities.append((row['CART_NO'], jaccard_sim, row['WORKLOAD']))
 
-            # 유사도가 먼 순으로 정렬
+            # SKU 유사도가 먼 순으로 정렬 + 작업량이 높은 순으로 정렬
             cart_similarities.sort(key=lambda x: (x[1], -x[2]))
 
             # 나머지 피커에 배정할 cart 조합 찾기
@@ -285,7 +284,7 @@ class WarehouseSolver:
                         if any(c in used_carts for c in combo_carts):
                             continue
 
-                        diff = abs(combo_workload - anchor_workload)
+                        diff = abs(combo_workload - highest_workload_quantity)
                         if diff < best_diff:
                             best_diff = diff
                             best_combo = combo_carts
@@ -309,54 +308,93 @@ class WarehouseSolver:
 
             batch_no += 1
 
-    def solve_picker_routing_KNN(self) -> None:
-        """
-        PRP: 각 BATCH_NO → PICKER_NO → CART_NO 순으로,
-        CART 안의 SKU LOC를 OD_MATRIX를 활용해 가까운 순으로 방문하도록 SEQ 지정
-        """
-        seq_records = []
+    def solve_picker_routing(self) -> None:
+        """피커 경로 최적화
+        1. 2-opt 초기해 설정
+        2. Simulated Annealing 근사해 최적화"""
+        
+        # 경로 전체 합
+        def calculate_total_distance(route, dist_matrix):
+            return sum(dist_matrix.loc[route[i], route[i + 1]] for i in range(len(route) - 1))
 
-        # 그룹 단위로 처리
-        for (batch_no, picker_no, cart_no), group in self.orders.groupby(['BATCH_NO', 'PICKER_NO', 'CART_NO']):
-            locs = group['LOC'].unique()
-            remaining_locs = set(locs)
-            route = []
-            current_loc = self.start_location
+        # 경로 뒤집어 보기
+        def two_opt(route, dist_matrix):
+            best = route
+            improved = True
+            while improved:
+                improved = False
+                for i in range(1, len(best) - 2): # start 지점 제외
+                    for j in range(i + 1, len(best) - 1):  # end 지점 제외
+                        # 1인 경우, 뒤집을 부분이 없으므로 다음 for문 진행
+                        if j - i == 1:
+                            continue
+                        # 경로 뒤집어보기
+                        new_route = best[:i] + best[i:j][::-1] + best[j:]
+                        if calculate_total_distance(new_route, dist_matrix) < calculate_total_distance(best, dist_matrix):
+                            best = new_route
+                            improved = True
+                if improved:
+                    break
+            return best
 
-            while remaining_locs:
-                next_loc = min(
-                    remaining_locs,
-                    key=lambda loc: self.od_matrix.loc[current_loc, loc]
-                )
-                route.append(next_loc)
-                remaining_locs.remove(next_loc)
-                current_loc = next_loc
+        def simulated_annealing(route, dist_matrix, initial_temp=1000, cooling_rate=0.995, min_temp=1):
+            current_route = route
+            current_distance = calculate_total_distance(current_route, dist_matrix)
+            best_route = list(current_route)
+            best_distance = current_distance
+            temperature = initial_temp
 
-            # LOC 방문 순서를 기준으로 SKU 행에 SEQ를 매김
+            while temperature > min_temp:
+                i, j = sorted(np.random.choice(range(1, len(route) - 1), 2, replace=False))  # exclude start/end
+                new_route = current_route[:i] + current_route[i:j][::-1] + current_route[j:]
+                new_distance = calculate_total_distance(new_route, dist_matrix)
+
+                # 경로가 좋아졌거나 새 경로가 좋지 않아도 일정 확률로 받아들임
+                # 점점 온도가 올라가면서 받아들일 확률이 높아짐
+                if new_distance < current_distance or np.random.random() < np.exp((current_distance - new_distance) / temperature):
+                    current_route = new_route
+                    current_distance = new_distance
+                    if new_distance < best_distance:
+                        best_route = new_route
+                        best_distance = new_distance
+
+                temperature *= cooling_rate
+            return best_route
+
+        # 실제 적용: 카트 단위로 LOC 최적화
+        self.orders['SEQ'] = 0
+        cart_groups = self.orders.groupby('CART_NO')
+        for cart_no, cart_df in cart_groups:
+            locs = cart_df['LOC'].dropna().unique().tolist()
+            if len(locs) <= 1:
+                route = locs
+            else:
+                # 전체 경로: START + LOCs + END
+                route = [self.start_location] + locs + [self.end_location]
+                route = two_opt(route, self.od_matrix)
+                route = simulated_annealing(route, self.od_matrix)
+                route = [loc for loc in route if loc not in [self.start_location, self.end_location]]  # SEQ는 중간 LOC만
+
             seq = 1
             for loc in route:
-                loc_rows = group[group['LOC'] == loc]
-                for idx in loc_rows.index:
-                    seq_records.append((idx, seq))
+                mask = (self.orders['CART_NO'] == cart_no) & (self.orders['LOC'] == loc)
+                loc_indices = self.orders[mask].index.tolist()
+                for idx in loc_indices:
+                    self.orders.at[idx, 'SEQ'] = seq
                     seq += 1
-
-        # SEQ를 orders에 반영
-        seq_df = pd.DataFrame(seq_records, columns=['index', 'SEQ']).set_index('index')
-        self.orders.loc[seq_df.index, 'SEQ'] = seq_df['SEQ']
-
 
     def solve(self) -> pd.DataFrame:
         """Execute complete warehouse optimization solution"""
         self.solve_storage_location()
         self.solve_order_batching()
         self.assign_batches_combination_sum_strategy()
-        self.solve_picker_routing_KNN()
-        '''if self.orders['LOC'].isna().any():
+        self.solve_picker_routing()
+        if self.orders['LOC'].isna().any():
             raise ValueError("LOC에 할당되지 않은 SKU가 있습니다.")
         if self.orders['CART_NO'].isna().any():
             raise ValueError("CART_NO가 지정되지 않았습니다.")
         if self.orders['SEQ'].isna().any():
-            raise ValueError("SEQ가 지정되지 않았습니다.")'''
+            raise ValueError("SEQ가 지정되지 않았습니다.")
         return self.orders
 
 def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) -> pd.DataFrame:
@@ -365,9 +403,9 @@ def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) 
 
 if __name__ == "__main__":
     import time
-    test_INPUT = pd.read_csv("sample_data/InputData.csv")
-    test_PARAM = pd.read_csv("sample_data/Parameters.csv")
-    test_OD = pd.read_csv("sample_data/OD_Matrix.csv", index_col=0, header=0)
+    test_INPUT = pd.read_csv("Sample_InputData.csv")
+    test_PARAM = pd.read_csv("sample_Parameters.csv")
+    test_OD = pd.read_csv("sample_OD_Matrix.csv", index_col=0, header=0)
     start_time = time.time()
     try:
         print("Data loaded successfully:")
