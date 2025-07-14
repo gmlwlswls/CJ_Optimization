@@ -3,7 +3,6 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Set
 from collections import defaultdict
-from ortoolpy import model_min, addvars, addvals
 from itertools import product, combinations
 from statistics import mode
 import re
@@ -12,7 +11,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from math import ceil
 
 # def main처럼 데이터프레임 타입으로 결과 리턴해주시면 됩니다. 데이터는 제공한 Sample_OutputData.csv와 동일한 형태로 리턴해주시면 됩니다.
-# SLAP - 고빈도 우선 + 주문 SKU 유사도 > 그리디 클러스터링으로 입출고 지점과 가까운 순으로 배정
+# SLAP - 고빈도 + 주문 유사도 MIP 방식
 # OLBP - 주문별 SKU유사도 + 랙 위치 유사도 > KMeans 클러스터링으로 4개의 주문씩 클러스터링
 # + 작업량 맞추는 작업
 # PRP - 2_opt + Simulated Annealing
@@ -68,61 +67,119 @@ class WarehouseSolver:
 
     ##### 1) SLAP
     def solve_storage_location(self) -> None:
-        """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
+        """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-ordered
+        1. 상위 20% SKU를 출고빈도 기준으로 정렬
+        2. 빈도순으로 차례로 꺼내고
+        - 자신이 입고지에서 가장 가까운 랙을 먼저 선점
+        - 공동 주문된 SKU들을 현재 랙 근처 가장 가까운 랙으로 Greedy 재배치
 
-        # 1. SKU 출고 빈도 계산 (NUM_PCS가 없으면 주문 건수 기준)
-        if 'NUM_PCS' in self.orders.columns:
-            freq = self.orders.groupby('SKU_CD')['NUM_PCS'].sum()
-        else:
-            freq = self.orders.groupby('SKU_CD').size()
-        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+        남은 SKU 중애 공동 주문된 SKU가 이미 배치되어 있다면
+        해당 랙들 근처(이미 배치된 sku가 많다면(<=> 랙이 많다면) 평균 거리)로 그리디 배치 
+        남은 랙, 남은 SKU에 대해서는 빈도수 기반으로 입출고 지점과 가깝게 배치"""
+        
+        def assgin_sku_to_loc_by_2step(top_percent = 0.2) :        
+            sku_freq = self.orders['SKU_CD'].value_counts()
+            top_k =int(len(sku_freq) * top_percent)
+            top_skus = sku_freq.head(top_k).index.tolist()
 
-        # 2. SKU 간 공동 주문 연관성(co-occurrence) 계산
-        cooc = defaultdict(int)
-        for _, group in self.orders.groupby('ORD_NO'):
-            for a, b in combinations(group['SKU_CD'], 2):
-                cooc[(a, b)] += 1
-                cooc[(b, a)] += 1
-        self.cooc = cooc
-        # 3. 시작 지점에서 가까운 랙부터 정렬
-        rack_locations = self.od_matrix.index[2:]
-        dist_start = self.od_matrix.loc[self.start_location, rack_locations]
-        rack_sorted = dist_start.sort_values().index.tolist()
+            # {SKU : {ORD, ,,}}
+            sku_orders = self.orders.groupby('SKU_CD')['ORD_NO'].apply(set).to_dict()
+            # sku_orders
 
-        # 4. 그리디 클러스터링: 가장 연관성이 높은 SKU들을 같은 클러스터(랙)로 묶기
-        assigned = set()
-        clusters = []
-        for sku in skus_by_freq:
-            if sku in assigned:
-                continue
-            cluster = {sku}
-            candidates = [s for s in skus_by_freq if s not in assigned]
-            # 연관성 높은 순 정렬
-            candidates.sort(key=lambda x: cooc.get((sku, x), 0), reverse=True)
-            for c in candidates:
-                if len(cluster) < self.params.rack_capacity:
-                    cluster.add(c)
-                else:
-                    break
-            assigned |= cluster
-            clusters.append(cluster)
+            cooc_sku_map = defaultdict(set)
+            for a in top_skus :
+                for b in sku_orders :
+                    if a == b :
+                        continue
+                    # 등장했던 주문 중 몇 번이나 함께 등장했는지
+                    inter = sku_orders[a] & sku_orders[b]
+                    # a와 b가 등장했던 총 주문
+                    union = sku_orders[a] | sku_orders[b]
+                    if union and len(inter) > 0 :
+                        cooc_sku_map[a].add(b)
 
-        # 5. 클러스터를 랙에 매핑
-        sku_to_location = {}
-        for rack, cluster in zip(rack_sorted, clusters):
-            for sku in cluster:
-                sku_to_location[sku] = rack
+            # cooc_sku_map - {빈도 높은 SKU : {함께 등장한 적 있는 SKU}}
+            racks = self.od_matrix.index[2:]
+            start_to_rack_dists=  self.od_matrix.loc[self.od_matrix.index[0], racks]
+            rack_sorted = start_to_rack_dists.sort_values().index.tolist()
 
-        # 6. 할당되지 않은 남은 SKU 처리 (랜덤 또는 빈도 순)
-        remaining = [s for s in skus_by_freq if s not in sku_to_location]
-        print('할당되지 않은 SKU :', len(remaining))
-        idx = len(clusters)
-        for sku in remaining:
-            rack = rack_sorted[idx // self.params.rack_capacity]
-            sku_to_location[sku] = rack
-            idx += 1
-        # 결과 반영
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+            assigned_skus = set()
+            # {rack : count}
+            rack_assign_count = {rack: 0 for rack in rack_sorted}
+            sku_to_loc = {}
+
+            # step1 : 상위 20% SKU 입출고 지점 + 공동 주문 SKU 가까이 배치
+            # 상위 20% SKU 입출고 지점 우선 배치
+            for sku in top_skus :
+                if sku in assigned_skus :
+                    continue
+                for rack in rack_sorted :
+                    if rack_assign_count[rack] < self.params.rack_capacity :
+                        sku_to_loc[sku] = rack
+                        assigned_skus.add(sku)
+                        rack_assign_count[rack] += 1
+                        base_rack = rack
+                        break
+              
+                # 공동 주문된 SKU들 가까이 배치
+                neighbors = cooc_sku_map[sku]
+                if not neighbors :
+                    continue
+            
+                # 기준 랙과의 거리
+                base_rack_dist = self.od_matrix.loc[base_rack, racks]
+                near_racks_sorted = base_rack_dist.sort_values().index.tolist()
+
+                for nb_sku in neighbors :
+                    if nb_sku in assigned_skus :
+                      continue
+                    for rack in near_racks_sorted :
+                        if rack_assign_count[rack] < self.params.rack_capacity :
+                            sku_to_loc[nb_sku] = rack
+                            assigned_skus.add(nb_sku)
+                            rack_assign_count[rack] += 1
+                            break
+                
+            # Step2 : 이미 배치되어 있는 sku와 공동 주문된 sku가 있다면 근처 배치
+            remaining_skus = [s for s in sku_freq.index if s not in assigned_skus]
+            for remained_sku in remaining_skus :
+                # {ORD, ORD, ,,} - remaining_sku별 등장한 주문 목록
+                remained_sku_orders = sku_orders.get(remained_sku, set())
+                co_ordered_assigned_locs = []
+                for assigned_sku in sku_to_loc :
+                    if assigned_sku == remained_sku :
+                        continue
+                    # 공동 주문된 ORD가 있다면
+                    if remained_sku_orders & sku_orders[assigned_sku] :
+                        co_ordered_assigned_locs.append(sku_to_loc[assigned_sku])
+
+                # remaining_sku가 이미 배치된 SKU와 공동 주문된 SKU가 있다면
+                # {RACK, RACK, ,,}
+                if co_ordered_assigned_locs :
+                    # 공동 주문된 SKU의 LOC까지의 평균 거리
+                    # RACK_1 : 33, ,, ~ RACK_168 : 26
+                    avg_dist = self.od_matrix.loc[racks, co_ordered_assigned_locs].mean(axis= 1)
+                    candidate_racks = avg_dist.sort_values().index.tolist()
+                # remaining_sku가 공동 주문된 SKU가 없다면
+                else :
+                    candidate_racks = rack_sorted
+
+                for rack in candidate_racks :
+                    if rack_assign_count[rack] < self.params.rack_capacity :
+                        assigned_skus.add(remained_sku)
+                        sku_to_loc[remained_sku] = rack
+                        rack_assign_count[rack] += 1
+                        break
+            
+            final_remained_skus = [s for s in sku_freq.index if s not in sku_to_loc]
+            print('할당되지 않은 SKU:', len(final_remained_skus))
+            final_remained_racks = [rack for rack, count in rack_assign_count.items() if count < self.params.rack_capacity]
+            print('빈자리가 남은 랙:', len(final_remained_racks))
+            
+            return sku_to_loc
+        
+        sku_to_loc = assgin_sku_to_loc_by_2step(top_percent= 0.2)
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_loc)
     
     #####2) OBSP
     def solve_order_batching(self) -> None:
@@ -406,8 +463,8 @@ def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) 
 if __name__ == "__main__":
     import time
     test_INPUT = pd.read_csv("Sample_InputData.csv")
-    test_PARAM = pd.read_csv("sample_Parameters.csv")
-    test_OD = pd.read_csv("sample_OD_Matrix.csv", index_col=0, header=0)
+    test_PARAM = pd.read_csv("Sample_Parameters.csv")
+    test_OD = pd.read_csv("Sample_OD_Matrix.csv", index_col=0, header=0)
     start_time = time.time()
     try:
         print("Data loaded successfully:")
@@ -416,7 +473,7 @@ if __name__ == "__main__":
         print(f"- OD Matrix: {test_OD.shape}")
 
         result = main(test_INPUT, test_PARAM, test_OD)
-        result.to_csv("Sample_OutputData.csv", index=False)
+        result.to_csv("./Sample_OutputData.csv", index=False)
         print("\nOptimization completed. Results preview:")
         print(result.head())
 

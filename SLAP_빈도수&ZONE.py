@@ -3,8 +3,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Set
 from collections import defaultdict
-from ortoolpy import model_min, addvars, addvals
-from itertools import product, combinations
+from itertools import combinations
 from statistics import mode
 import re
 from sklearn.cluster import KMeans
@@ -71,68 +70,11 @@ class WarehouseSolver:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
 
         # 1. SKU 출고 빈도 계산 (NUM_PCS가 없으면 주문 건수 기준)
-        if 'NUM_PCS' in self.orders.columns:
-            freq = self.orders.groupby('SKU_CD')['NUM_PCS'].sum()
-        else:
-            freq = self.orders.groupby('SKU_CD').size()
-        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
 
-        # 2. SKU 간 공동 주문 연관성(co-occurrence) 계산
-        cooc = defaultdict(int)
-        for _, group in self.orders.groupby('ORD_NO'):
-            for a, b in combinations(group['SKU_CD'], 2):
-                cooc[(a, b)] += 1
-                cooc[(b, a)] += 1
-        self.cooc = cooc
-        # 3. 시작 지점에서 가까운 랙부터 정렬
-        rack_locations = self.od_matrix.index[2:]
-        dist_start = self.od_matrix.loc[self.start_location, rack_locations]
-        rack_sorted = dist_start.sort_values().index.tolist()
-
-        # 4. 그리디 클러스터링: 가장 연관성이 높은 SKU들을 같은 클러스터(랙)로 묶기
-        assigned = set()
-        clusters = []
-        for sku in skus_by_freq:
-            if sku in assigned:
-                continue
-            cluster = {sku}
-            candidates = [s for s in skus_by_freq if s not in assigned]
-            # 연관성 높은 순 정렬
-            candidates.sort(key=lambda x: cooc.get((sku, x), 0), reverse=True)
-            for c in candidates:
-                if len(cluster) < self.params.rack_capacity:
-                    cluster.add(c)
-                else:
-                    break
-            assigned |= cluster
-            clusters.append(cluster)
-
-        # 5. 클러스터를 랙에 매핑
-        sku_to_location = {}
-        for rack, cluster in zip(rack_sorted, clusters):
-            for sku in cluster:
-                sku_to_location[sku] = rack
-
-        # 6. 할당되지 않은 남은 SKU 처리 (랜덤 또는 빈도 순)
-        remaining = [s for s in skus_by_freq if s not in sku_to_location]
-        print('할당되지 않은 SKU :', len(remaining))
-        idx = len(clusters)
-        for sku in remaining:
-            rack = rack_sorted[idx // self.params.rack_capacity]
-            sku_to_location[sku] = rack
-            idx += 1
-        # 결과 반영
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
-    
-    #####2) OBSP
-    def solve_order_batching(self) -> None:
-        def extract_loc_num(loc_name) :
-            """
-            LOC 이름(WP_0001 등)에서 숫자 부분만 추출하여 정수로 반환
-            """
+        def extract_loc_num(loc_name):
             match = re.search(r'\d+', loc_name)
             return int(match.group()) if match else None
-                
+              
         def estimate_row_count_from_od_matrix(od_matrix) :
             """
             OD Matrix에서 랙 간 거리 분포를 보고 한 줄에 몇 개 있는지, 전체 줄 수를 추정
@@ -154,6 +96,46 @@ class WarehouseSolver:
             total_racks = len(od_matrix)
             est_row_count = total_racks // est_rack_count # 구역 갯수
             return est_rack_count        
+        
+        # ZONE 정의
+        est_rack_count = estimate_row_count_from_od_matrix(self.od_matrix)
+        racks= self.od_matrix.index[2:]
+        rack_df = pd.DataFrame({
+          'LOC' : racks,
+          'NUM' : [extract_loc_num(loc) for loc in racks]
+        })
+
+    
+    #####2) OBSP
+    def solve_order_batching(self) -> None:
+        def extract_loc_num(loc_name) :
+            """
+            LOC 이름(WP_0001 등)에서 숫자 부분만 추출하여 정수로 반환
+            """
+            match = re.search(r'\d+', loc_name)
+            return int(match.group()) if match else None
+
+        def estimate_row_count_from_od_matrix(od_matrix) :
+            """
+            OD Matrix에서 랙 간 거리 분포를 보고 한 줄에 몇 개 있는지, 전체 줄 수를 추정
+            """
+            row_len_candidates = []
+            for rack in od_matrix.index :  
+                distances = od_matrix.loc[rack].sort_values()
+                diffs = distances.diff().fillna(0)
+                
+                # 급격히 증가하는 지점 찾기 (거리 급증)
+                jump_indices = np.where(diffs > 5)[0]  # 거리 단위 기준 조정 가능
+                
+                if len(jump_indices) > 0:
+                    row_len_candidates.append(jump_indices[0])  # 첫 번째 점프 위치
+                    
+            # 최빈값 = 추정된 한 줄 랙 수
+            est_rack_count = mode(row_len_candidates) # 한 구역에 포함된 랙의 갯수
+            # 전체 랙 수에서 줄 수 계산
+            total_racks = len(od_matrix)
+            est_row_count = total_racks // est_rack_count # 구역 갯수
+            return est_rack_count                  
 
         def assign_zone_by_locnum(slap_loc_df, rack_count):
             """
