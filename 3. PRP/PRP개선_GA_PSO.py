@@ -57,8 +57,6 @@ class WarehouseSolver:
         if not required_columns.issubset(self.orders.columns):
             raise ValueError(f"Missing required columns: {required_columns - set(self.orders.columns)}")
 
-
-
     ##### 1) SLAP
     def solve_storage_location(self) -> None:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-ordered
@@ -327,7 +325,6 @@ class WarehouseSolver:
         return self.orders
 
 
-
     def remapping_cart_no(self):
         # ✅ 루프 종료 후 CART_NO 재매핑
         self.orders = self.orders.sort_values(['BATCH_NO', 'PICKER_NO'])
@@ -346,66 +343,129 @@ class WarehouseSolver:
         self.orders['CART_NO'] = self.orders['CART_NO'].map(cart_mapping_ordered)
 
 
-
-
     def solve_picker_routing_parallel(self) -> None:
         """피커 경로 최적화 (병렬처리)
-        - 2-opt + Simulated Annealing
+        GA로 우수한 경로 후보 탐색
+        PSO 초기 입자로 GA 결과를 사용해 정밀 최적화
         """
+        
+        def ga_optimize_population(locs, dist_matrix, top_k=10, population_size=40, n_generations=60, elite_size=8, mutation_rate=0.3):
+            def calculate_total_distance(route):
+                full_route = [self.start_location] + route + [self.end_location]
+                return sum(dist_matrix.loc[full_route[i], full_route[i + 1]] for i in range(len(full_route) - 1))
 
-        def calculate_total_distance(route, dist_matrix):
-            return sum(dist_matrix.loc[route[i], route[i + 1]] for i in range(len(route) - 1))
+            def create_individual():
+                return list(np.random.permutation(locs))
 
-        def two_opt(route, dist_matrix):
-            best = route
-            improved = True
-            while improved:
-                improved = False
-                for i in range(1, len(best) - 2):
-                    for j in range(i + 1, len(best) - 1):
-                        if j - i == 1:
-                            continue
-                        new_route = best[:i] + best[i:j][::-1] + best[j:]
-                        if calculate_total_distance(new_route, dist_matrix) < calculate_total_distance(best, dist_matrix):
-                            best = new_route
-                            improved = True
-                if improved:
-                    break
-            return best
+            def crossover(p1, p2):
+                start, end = np.sort(np.random.choice(len(p1), 2, replace=False))
+                segment = p1[start:end+1]
+                remainder = [g for g in p2 if g not in segment]
+                return remainder[:start] + segment + remainder[start:]
 
-        def simulated_annealing(route, dist_matrix, initial_temp=1000, cooling_rate=0.995, min_temp=0.01):
-            current_route = route
-            current_distance = calculate_total_distance(current_route, dist_matrix)
-            best_route = list(current_route)
-            best_distance = current_distance
-            temperature = initial_temp
+            def mutate(ind):
+                if np.random.rand() < mutation_rate:
+                    i, j = np.random.choice(len(ind), 2, replace=False)
+                    ind[i], ind[j] = ind[j], ind[i]
+                return ind
 
-            while temperature > min_temp:
-                i, j = sorted(np.random.choice(range(1, len(route) - 1), 2, replace=False))
-                new_route = current_route[:i] + current_route[i:j][::-1] + current_route[j:]
-                new_distance = calculate_total_distance(new_route, dist_matrix)
+            population = [create_individual() for _ in range(population_size)]
 
-                if new_distance < current_distance or np.random.random() < np.exp((current_distance - new_distance) / temperature):
-                    current_route = new_route
-                    current_distance = new_distance
-                    if new_distance < best_distance:
-                        best_route = new_route
-                        best_distance = new_distance
+            for _ in range(n_generations):
+                fitness = [(ind, calculate_total_distance(ind)) for ind in population]
+                fitness.sort(key=lambda x: x[1])
+                ranked = [ind for ind, _ in fitness]
+                next_gen = ranked[:elite_size]
+                while len(next_gen) < population_size:
+                    selected_indices = np.random.choice(len(ranked[:10]), 2, replace= False)
+                    p1, p2 = ranked[selected_indices[0]], ranked[selected_indices[1]]
+                    child = crossover(p1, p2)
+                    child = mutate(child)
+                    next_gen.append(child)
+                population = next_gen
 
-                temperature *= cooling_rate
+            # 최종 top K개 반환
+            final_fitness = [(ind, calculate_total_distance(ind)) for ind in population]
+            final_fitness.sort(key=lambda x: x[1])
+            top_routes = [ind for ind, _ in final_fitness[:top_k]]
+            return top_routes
 
-            return best_route
+        def pso_refine_from_seed(seed_routes, locs, dist_matrix, n_iterations=80, w=0.35, c1=1.8, c2=2.0):
+            import copy
 
+            def calculate_total_distance(route):
+                full_route = [self.start_location] + route + [self.end_location]
+                return sum(dist_matrix.loc[full_route[i], full_route[i + 1]] for i in range(len(full_route) - 1))
+
+            def get_swap_sequence(r1, r2):
+                r1 = r1[:]
+                swaps = []
+                for i in range(len(r1)):
+                    if r1[i] != r2[i]:
+                        j = r1.index(r2[i])
+                        swaps.append((i, j))
+                        r1[i], r1[j] = r1[j], r1[i]
+                return swaps
+
+            def apply_swaps(r, swaps):
+                r = r[:]
+                for i, j in swaps:
+                    r[i], r[j] = r[j], r[i]
+                return r
+
+            n_particles = len(seed_routes)
+            particles = seed_routes[:]
+            velocities = [[] for _ in range(n_particles)]
+
+            p_bests = copy.deepcopy(particles)
+            p_best_scores = [calculate_total_distance(p) for p in particles]
+
+            g_best = p_bests[np.argmin(p_best_scores)]
+            g_best_score = min(p_best_scores)
+
+            for _ in range(n_iterations):
+                for i in range(n_particles):
+                    v_p = get_swap_sequence(particles[i], p_bests[i])
+                    v_g = get_swap_sequence(particles[i], g_best)
+
+                    v_new = []
+                    for swap in v_p:
+                        if np.random.rand() < c1:
+                            v_new.append(swap)
+                    for swap in v_g:
+                        if np.random.rand() < c2:
+                            v_new.append(swap)
+                    if np.random.rand() < w:
+                        v_new = velocities[i] + v_new
+
+                    velocities[i] = v_new
+                    particles[i] = apply_swaps(particles[i], v_new)
+
+                    score = calculate_total_distance(particles[i])
+                    if score < p_best_scores[i]:
+                        p_bests[i] = particles[i]
+                        p_best_scores[i] = score
+                        if score < g_best_score:
+                            g_best = particles[i]
+                            g_best_score = score
+
+            return g_best        
 
         def optimize_cart_route(cart_no, cart_df, od_matrix):
             locs = cart_df['LOC'].dropna().unique().tolist()
             if len(locs) <= 1:
                 route = locs
             else:
-                route = [od_matrix.index[0]] + locs + [od_matrix.index[1]]
-                route = two_opt(route, self.od_matrix)
-                route = simulated_annealing(route, od_matrix)
-                route = [loc for loc in route if loc not in [od_matrix.index[0], od_matrix.index[1]]]
+                top_ga_routes = ga_optimize_population(
+                    locs, od_matrix, top_k= 10,
+                    population_size= 80, n_generations= 150,
+                    elite_size= 15, mutation_rate= 0.4
+                )
+                
+                route = pso_refine_from_seed(
+                    top_ga_routes, locs, od_matrix,
+                    n_iterations= 150, w= 0.3
+                )
 
             seq_records = []
             seq = 1
@@ -469,6 +529,7 @@ class WarehouseSolver:
         self.solve_picker_routing_parallel()
         self.calculate_total_picking_time()
         return self.orders
+
 def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) -> pd.DataFrame:
     solver = WarehouseSolver(INPUT, PARAMETER, OD_MATRIX)
     result = solver.solve()
@@ -480,3 +541,4 @@ if __name__ == "__main__":
     test_OD = pd.read_csv("./data/Sample_OD_Matrix.csv", index_col=0, header=0)
     result = main(test_INPUT, test_PARAM, test_OD)
     result.to_csv("OutputData.csv", index=False)
+
